@@ -229,6 +229,20 @@ module Twitter
         update!(status, options.merge(media_ids: media_ids.join(',')))
       end
 
+      def update_with_video(status, media, options = {})
+        options = options.dup
+        result = upload_async media, 'video/mp4', 'tweet_video'
+        if result[:processing_info]
+          result = poll_upload_status(result)
+        end
+
+        if upload_state(result) == 'succeeded'
+          media_ids = [ result[:media_id] ]
+          update!(status, options.merge(media_ids: media_ids.join(',')))
+          # TODO: error handling
+        end
+      end
+
       # Returns oEmbed for a Tweet
       #
       # @see https://dev.twitter.com/rest/reference/get/statuses/oembed
@@ -354,6 +368,36 @@ module Twitter
         end
       end
 
+      # Specifying the media_category allows uploading of larger videos. The
+      # supported categories are: tweet_image, tweet_gif, tweet_video, amplify_video
+      #
+      # Another effect of specifying the media_category is that you must check to
+      # see if your upload is still being processed by twitter ... use poll_upload_status()
+      # to wait for processing to complete before trying to use the uploaded media
+      def upload_async(media, media_type, media_category)
+        init = Twitter::REST::Request.new(self, :post, 'https://upload.twitter.com/1.1/media/upload.json',
+                                          command: 'INIT',
+                                          media_type: media_type,
+                                          media_category: media_category,
+                                          total_bytes: media.size).perform
+
+        until media.eof?
+          chunk = media.read(5_000_000)
+          seg ||= -1
+          Twitter::REST::Request.new(self, :multipart_post, 'https://upload.twitter.com/1.1/media/upload.json',
+                                     command: 'APPEND',
+                                     media_id: init[:media_id],
+                                     segment_index: seg += 1,
+                                     key: :media,
+                                     file: StringIO.new(chunk)).perform
+        end
+
+        media.close
+
+        Twitter::REST::Request.new(self, :post, 'https://upload.twitter.com/1.1/media/upload.json',
+                                   command: 'FINALIZE', media_id: init[:media_id]).perform
+      end
+
       def array_wrap(object)
         if object.respond_to?(:to_ary)
           object.to_ary || [object]
@@ -371,6 +415,30 @@ module Twitter
         response = perform_post("/1.1/statuses/unretweet/#{extract_id(tweet)}.json", options)
         Twitter::Tweet.new(response)
       end
+
+      def poll_upload_status(result)
+        # {:media_id=>754118714899910657, :media_id_string=>"754118714899910657", :size=>24406814, :expires_after_secs=>86400, :processing_info=>{:state=>"pending", :check_after_secs=>5}}end
+        state = upload_state(result)
+        check_after_secs = check_status_after(result)
+
+        until state == 'succeeded' || state == 'failed'
+          sleep check_after_secs
+          # why does this need the domain name, but other calls don't?
+          result = perform_get("https://upload.twitter.com/1.1/media/upload.json?command=STATUS&media_id=#{result[:media_id]}")
+          state = upload_state(result)
+          check_after_secs = check_status_after(result)
+        end
+        result
+      end
+
+      def upload_state(result)
+        result[:processing_info][:state]
+      end
+
+      def check_status_after(result)
+        result[:processing_info][:check_after_secs]
+      end
+
     end
   end
 end
